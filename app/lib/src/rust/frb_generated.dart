@@ -78,7 +78,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -2035966255;
+  int get rustContentHash => 68183990;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -443,6 +443,8 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<void> crateApiPriceSetPriceCurrency({String? currency});
+
+  void crateApiSyncSetSyncPace({required bool foreground});
 
   Future<void> crateApiNodesTrustCertificate({
     required String url,
@@ -3411,6 +3413,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  void crateApiSyncSetSyncPace({required bool foreground}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_bool(foreground, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 89)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSyncSetSyncPaceConstMeta,
+        argValues: [foreground],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSyncSetSyncPaceConstMeta =>
+      const TaskConstMeta(debugName: "set_sync_pace", argNames: ["foreground"]);
+
+  @override
   Future<void> crateApiNodesTrustCertificate({
     required String url,
     required String fingerprint,
@@ -3424,7 +3449,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 89,
+            funcId: 90,
             port: port_,
           );
         },
@@ -3459,7 +3484,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 90,
+            funcId: 91,
             port: port_,
           );
         },

@@ -41,25 +41,26 @@ impl OpenWallet {
     pub fn coins(&self) -> Result<Vec<CoinRow>, WalletError> {
         let frozen = self.inner.with(|w| Ok(w.data.frozen.clone()))?;
         let tip = self.inner.sync.tip.load(Ordering::Relaxed);
-        let state = self.inner.sync.snapshot();
-        let mut rows: Vec<CoinRow> = state
-            .outputs
-            .iter()
-            .filter(|o| o.spent.is_none())
-            .map(|o| {
-                let key = hex_string(&o.output.key().compress().to_bytes());
-                CoinRow {
-                    frozen: frozen.contains(&key),
-                    key,
-                    amount: o.amount(),
-                    height: o.height,
-                    subaddress_index: o.output.subaddress().map_or(0, |s| s.address()),
-                    miner: o.miner,
-                    locked: tip < o.unlock_height(),
-                    tx_hash: hex_string(&o.output.transaction()),
-                }
-            })
-            .collect();
+        let mut rows: Vec<CoinRow> = self.inner.sync.read(|state| {
+            state
+                .outputs
+                .iter()
+                .filter(|o| o.spent.is_none())
+                .map(|o| {
+                    let key = hex_string(&o.output.key().compress().to_bytes());
+                    CoinRow {
+                        frozen: frozen.contains(&key),
+                        key,
+                        amount: o.amount(),
+                        height: o.height,
+                        subaddress_index: o.output.subaddress().map_or(0, |s| s.address()),
+                        miner: o.miner,
+                        locked: tip < o.unlock_height(),
+                        tx_hash: hex_string(&o.output.transaction()),
+                    }
+                })
+                .collect()
+        });
         rows.sort_by_key(|r| std::cmp::Reverse(r.amount));
         Ok(rows)
     }

@@ -360,8 +360,11 @@ impl OpenWallet {
     /// [`ColdFailure::NotWatching`] for a wallet that can sign itself.
     pub fn cold_sync_request(&self) -> Result<ColdMessage, ColdFailure> {
         let (keys, network) = self.watching()?;
-        let state = self.inner.sync.snapshot();
-        Ok(ColdMessage::of(&cold::sync_request(&keys, network, &state)))
+        let request = self
+            .inner
+            .sync
+            .read(|state| cold::sync_request(&keys, network, state));
+        Ok(ColdMessage::of(&request))
     }
 
     /// Watching wallet: how many coins still need key images from the cold
@@ -373,8 +376,11 @@ impl OpenWallet {
     #[frb(sync)]
     pub fn coins_without_key_images(&self) -> Result<u32, WalletError> {
         self.inner.with(|_| Ok(()))?;
-        let state = self.inner.sync.snapshot();
-        Ok(u32::try_from(state.outputs_without_key_images().len()).unwrap_or(u32::MAX))
+        let missing = self
+            .inner
+            .sync
+            .read(|state| state.outputs_without_key_images().len());
+        Ok(u32::try_from(missing).unwrap_or(u32::MAX))
     }
 
     /// Watching wallet: builds a transaction for the cold wallet to sign.

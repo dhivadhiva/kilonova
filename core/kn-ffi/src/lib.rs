@@ -5,6 +5,8 @@
 //! wallet logic of its own.
 
 pub mod api;
+#[cfg(test)]
+mod bench;
 mod node_settings;
 #[cfg(test)]
 mod test_store;

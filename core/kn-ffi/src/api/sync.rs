@@ -5,17 +5,18 @@
 //! (`kn_sync::lws_sync`). Both fill the same state, so balance and history
 //! do not care which mode produced them.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flutter_rust_bridge::frb;
 use kn_keys::WalletKeys;
 use kn_store::{SyncMode as StoreSyncMode, UnlockedWallet};
 use kn_sync::{
-    Direction, LwsServer, NodeUrl, SyncError, SyncState, approximate_height, connect, lws_sync,
-    sync,
+    Direction, LwsServer, MoneroDaemonHttp, NodeUrl, SyncCache, SyncError, SyncState,
+    approximate_height, connect, lws_sync, sync_with,
 };
+use tokio::sync::Notify;
 
 use super::network::Network;
 use super::nodes::{RUNTIME, current_node, lws_server};
@@ -26,6 +27,48 @@ use crate::frb_generated::StreamSink;
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(30);
 /// How often to ask a light wallet server while it is still catching up.
 const LWS_CATCH_UP_INTERVAL: Duration = Duration::from_secs(3);
+/// The shortest wait between looks while the app is in the background: a
+/// block comes every two minutes, and nobody is watching.
+const BACKGROUND_INTERVAL: Duration = Duration::from_mins(5);
+/// The longest wait between retries of a node that cannot be reached.
+const MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
+/// How often the cache is written while scanning. A crash loses at most
+/// this much scanning; writing after every batch wore storage and battery.
+const SAVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether the app is in the foreground; see [`set_sync_pace`].
+static FOREGROUND: AtomicBool = AtomicBool::new(true);
+/// Wakes waiting syncs when the pace changes.
+static PACE: Notify = Notify::const_new();
+
+/// Tells sync whether the app is in the foreground. In the background,
+/// wallets at the chain tip look for new blocks every five minutes instead
+/// of every thirty seconds (a sync still catching up keeps going); coming
+/// back to the foreground looks right away if a look is due.
+#[frb(sync)]
+pub fn set_sync_pace(foreground: bool) {
+    let was = FOREGROUND.swap(foreground, Ordering::Relaxed);
+    if foreground && !was {
+        PACE.notify_waiters();
+    }
+}
+
+/// How long to wait before the next look, given what the round asked for.
+fn paced(wait: Duration, foreground: bool) -> Duration {
+    if foreground {
+        wait
+    } else {
+        wait.max(BACKGROUND_INTERVAL)
+    }
+}
+
+/// Wait before retrying a node after `failures` failed rounds in a row:
+/// doubling from [`FOLLOW_INTERVAL`] up to [`MAX_RETRY_INTERVAL`].
+fn retry_interval(failures: u32) -> Duration {
+    FOLLOW_INTERVAL
+        .saturating_mul(1 << failures.saturating_sub(1).min(8))
+        .min(MAX_RETRY_INTERVAL)
+}
 
 /// Why sync stopped with an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +197,11 @@ pub(crate) struct SyncHandle {
     /// Set once a run reaches the chain tip; sending waits for it so it
     /// never builds on a stale view of the wallet.
     pub(crate) caught_up: AtomicBool,
+    /// `state` has changes the cache file does not.
+    dirty: AtomicBool,
+    last_save: Mutex<Option<Instant>>,
+    /// Wakes a waiting run when it is stopped or replaced.
+    wake: Notify,
 }
 
 impl SyncHandle {
@@ -169,6 +217,9 @@ impl SyncHandle {
             current: Mutex::new(Arc::new(AtomicBool::new(true))),
             generation: AtomicU64::new(0),
             caught_up: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            last_save: Mutex::new(None),
+            wake: Notify::new(),
         }
     }
 
@@ -179,32 +230,84 @@ impl SyncHandle {
         if let Ok(state) = inner.with(|w| Ok(starting_state(w))) {
             self.tip.store(state.next_height, Ordering::Relaxed);
             *self.lock_state() = state;
+            self.dirty.store(false, Ordering::Relaxed);
         }
+        self.wake.notify_waiters();
     }
 
     pub(crate) fn stop(&self) {
         self.lock_current().store(true, Ordering::Relaxed);
+        self.wake.notify_waiters();
     }
 
     /// Stops the current run and keeps it from writing state again, so the
     /// caller can change the state; start sync afterwards.
     pub(crate) fn pause(&self) {
-        self.stop();
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.stop();
     }
 
     /// The scanned state and the chain tip, if sync has reached the tip.
     pub(crate) fn caught_up_state(&self) -> Option<(SyncState, u64)> {
         let tip = self.tip.load(Ordering::Relaxed);
-        let state = self.snapshot();
-        (self.caught_up.load(Ordering::Relaxed) && state.next_height >= tip).then_some((state, tip))
+        let caught_up =
+            self.caught_up.load(Ordering::Relaxed) && self.read(|state| state.next_height >= tip);
+        caught_up.then(|| (self.snapshot(), tip))
     }
 
     /// Replaces the state and saves the encrypted cache.
     pub(crate) fn replace(&self, inner: &Inner, state: SyncState) {
         let bytes = state.to_bytes();
         *self.lock_state() = state;
-        let _ = inner.with(|w| store()?.save_cache(w, &bytes).map_err(WalletError::from));
+        self.dirty.store(false, Ordering::Relaxed);
+        self.save_bytes(inner, &bytes);
+    }
+
+    /// Takes in a run's state; the cache is written when `force`d or when
+    /// [`SAVE_INTERVAL`] has passed since the last write, and only if
+    /// something changed.
+    fn update(&self, inner: &Inner, state: &SyncState, force: bool) {
+        {
+            let mut shared = self.lock_state();
+            if *shared != *state {
+                shared.clone_from(state);
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        let due = force
+            || self
+                .lock_last_save()
+                .is_none_or(|at| at.elapsed() >= SAVE_INTERVAL);
+        if due {
+            self.flush(inner);
+        }
+    }
+
+    /// Writes the cache if the state changed since it was last written.
+    pub(crate) fn flush(&self, inner: &Inner) {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let bytes = self.lock_state().to_bytes();
+        self.save_bytes(inner, &bytes);
+    }
+
+    fn save_bytes(&self, inner: &Inner, bytes: &[u8]) {
+        // A lost cache only costs a rescan, so a failed save is not worth
+        // stopping for.
+        let _ = inner.with(|w| store()?.save_cache(w, bytes).map_err(WalletError::from));
+        *self.lock_last_save() = Some(Instant::now());
+    }
+
+    fn lock_last_save(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.last_save
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Reads the state without copying it.
+    pub(crate) fn read<T>(&self, f: impl FnOnce(&SyncState) -> T) -> T {
+        f(&self.lock_state())
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, SyncState> {
@@ -252,6 +355,14 @@ impl OpenWallet {
     /// following new blocks until [`OpenWallet::stop_sync`] or
     /// [`OpenWallet::lock`]. Calling it again restarts sync.
     pub fn start_sync(&self, sink: StreamSink<SyncEvent>) {
+        self.start_sync_with(move |event| {
+            let _ = sink.add(event);
+        });
+    }
+
+    /// [`OpenWallet::start_sync`] with any receiver of the events.
+    #[frb(ignore)]
+    pub(crate) fn start_sync_with(&self, sink: impl Fn(SyncEvent) + Send + Sync + 'static) {
         // A cold wallet never goes online.
         if self.inner.with(|w| Ok(w.entry.cold)).unwrap_or(true) {
             return;
@@ -264,6 +375,7 @@ impl OpenWallet {
             *current = cancel.clone();
         }
         let generation = inner.sync.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        inner.sync.wake.notify_waiters();
         RUNTIME.spawn(async move {
             let run = Run {
                 inner: &inner,
@@ -273,12 +385,13 @@ impl OpenWallet {
                 failed: AtomicBool::new(false),
                 opinion_done: AtomicBool::new(false),
                 disagrees: AtomicBool::new(false),
+                failures: AtomicU32::new(0),
             };
             run.go().await;
             // After a failure the failure stays on screen, since it says
             // what to do next; "stopped" is only for a deliberate stop.
             if run.is_current() && !run.failed.load(Ordering::Relaxed) {
-                let _ = sink.add(SyncEvent::new(SyncPhase::Stopped));
+                sink(SyncEvent::new(SyncPhase::Stopped));
             }
         });
     }
@@ -294,7 +407,7 @@ impl OpenWallet {
     #[must_use]
     pub fn balance(&self) -> WalletBalance {
         let tip = self.inner.sync.tip.load(Ordering::Relaxed);
-        let b = self.inner.sync.snapshot().balance(tip);
+        let b = self.inner.sync.read(|state| state.balance(tip));
         WalletBalance {
             total: b.total,
             unlocked: b.unlocked,
@@ -307,7 +420,7 @@ impl OpenWallet {
     #[must_use]
     pub fn history(&self) -> Vec<HistoryItem> {
         let tip = self.inner.sync.tip.load(Ordering::Relaxed);
-        let state = self.inner.sync.snapshot();
+        let history = self.inner.sync.read(SyncState::history);
         // Notes and recipients live in the wallet file; copy what history
         // needs so the wallet lock is held briefly.
         let (notes, sent_to) = self
@@ -329,8 +442,7 @@ impl OpenWallet {
                 Ok((w.data.notes.clone(), sent_to))
             })
             .unwrap_or_default();
-        state
-            .history()
+        history
             .into_iter()
             .map(|h| {
                 let lock = if h.miner {
@@ -361,7 +473,7 @@ impl OpenWallet {
 /// One background sync run.
 struct Run<'a> {
     inner: &'a Inner,
-    sink: &'a StreamSink<SyncEvent>,
+    sink: &'a (dyn Fn(SyncEvent) + Send + Sync),
     cancel: &'a AtomicBool,
     generation: u64,
     /// Set when the run ends because of a failure it reported.
@@ -370,6 +482,24 @@ struct Run<'a> {
     opinion_done: AtomicBool,
     /// The node disagreed with the independent one.
     disagrees: AtomicBool,
+    /// Rounds in a row that could not reach the node or server.
+    failures: AtomicU32,
+}
+
+/// Connections a run keeps between rounds, so following the tip does not
+/// connect (and, over https or Tor, handshake) again every time.
+#[frb(ignore)]
+#[derive(Default)]
+struct Connections {
+    node: Option<NodeConnection>,
+    lws: Option<(NodeUrl, LwsServer)>,
+}
+
+#[frb(ignore)]
+struct NodeConnection {
+    url: NodeUrl,
+    daemon: MoneroDaemonHttp,
+    cache: SyncCache,
 }
 
 /// What a run needs from the wallet, copied out so the wallet lock is not
@@ -401,24 +531,18 @@ impl Run<'_> {
             if event.phase == SyncPhase::Synced {
                 self.inner.sync.caught_up.store(true, Ordering::Relaxed);
             }
-            let _ = self.sink.add(event);
+            (self.sink)(event);
         }
     }
 
-    /// Stores progress (and the encrypted cache) if this run is current.
-    fn record(&self, state: &SyncState, tip: u64) {
+    /// Stores progress if this run is current; the encrypted cache is
+    /// written now if `force`d, else at most every [`SAVE_INTERVAL`].
+    fn record(&self, state: &SyncState, tip: u64, force: bool) {
         if !self.is_current() {
             return;
         }
         self.inner.sync.tip.store(tip, Ordering::Relaxed);
-        *self.inner.sync.lock_state() = state.clone();
-        // A lost cache only costs a rescan, so a failed save is not worth
-        // stopping for.
-        let _ = self.inner.with(|w| {
-            store()?
-                .save_cache(w, &state.to_bytes())
-                .map_err(WalletError::from)
-        });
+        self.inner.sync.update(self.inner, state, force);
     }
 
     async fn go(&self) {
@@ -435,25 +559,54 @@ impl Run<'_> {
         }) else {
             return;
         };
+        let mut connections = Connections::default();
         while !self.stopped() {
             let wait = match setup.mode {
-                StoreSyncMode::Full => self.full_round(&setup).await,
-                StoreSyncMode::Lws => self.lws_round(&setup).await,
+                StoreSyncMode::Full => self.full_round(&setup, &mut connections).await,
+                StoreSyncMode::Lws => self.lws_round(&setup, &mut connections).await,
             };
-            let Some(wait) = wait else { return };
-            // Check for a cancel every second while waiting.
-            for _ in 0..wait.as_secs() {
-                if self.stopped() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(wait) = wait else { break };
+            if !self.wait(wait).await {
+                break;
+            }
+        }
+        // Scanning since the last write is kept, unless another run or a
+        // send has taken over the state.
+        if self.is_current() {
+            self.inner.sync.flush(self.inner);
+        }
+    }
+
+    /// Sleeps for `wait`, longer in the background (see [`set_sync_pace`]).
+    /// Returns `false` as soon as the run is stopped, without polling for
+    /// it.
+    async fn wait(&self, wait: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            let woken = self.inner.sync.wake.notified();
+            let paced_again = PACE.notified();
+            tokio::pin!(woken, paced_again);
+            // Registered before the checks, so a wake between them is kept.
+            woken.as_mut().enable();
+            paced_again.as_mut().enable();
+            if self.stopped() {
+                return false;
+            }
+            let due = start + paced(wait, FOREGROUND.load(Ordering::Relaxed));
+            let Some(left) = due.checked_duration_since(Instant::now()) else {
+                return true;
+            };
+            tokio::select! {
+                () = tokio::time::sleep(left) => {}
+                () = woken => {}
+                () = paced_again => {}
             }
         }
     }
 
     /// One full-mode pass to the tip. Returns how long to wait before the
     /// next, or `None` to stop.
-    async fn full_round(&self, setup: &Setup) -> Option<Duration> {
+    async fn full_round(&self, setup: &Setup, connections: &mut Connections) -> Option<Duration> {
         let Ok(node) = current_node(setup.network.into()) else {
             self.emit(SyncEvent::failed(SyncFailure::BadNode));
             return None;
@@ -464,18 +617,18 @@ impl Run<'_> {
         });
         let mut state = self.inner.sync.snapshot();
         let result = async {
-            let (daemon, status) = connect(&node, setup.network).await?;
-            if !status.test_chain && !self.opinion_done.swap(true, Ordering::Relaxed) {
-                self.second_opinion(&daemon, &node, setup.network).await;
-            }
-            sync(
-                &daemon,
+            let (daemon, cache) = self
+                .node(&node, setup.network, &mut connections.node)
+                .await?;
+            sync_with(
+                daemon,
+                cache,
                 &setup.keys,
                 &setup.accounts,
                 &mut state,
                 self.cancel,
                 |state, progress| {
-                    self.record(state, progress.tip);
+                    self.record(state, progress.tip, false);
                     self.emit(SyncEvent {
                         scanned: progress.scanned,
                         tip: progress.tip,
@@ -488,10 +641,11 @@ impl Run<'_> {
         .await;
         match result {
             Ok(()) => {
+                self.failures.store(0, Ordering::Relaxed);
                 let tip = self.inner.sync.tip.load(Ordering::Relaxed);
                 // At the tip, sync also expires dropped spends and reads the
                 // transaction pool; keep that too.
-                self.record(&state, tip);
+                self.record(&state, tip, true);
                 self.emit(SyncEvent {
                     scanned: tip,
                     tip,
@@ -499,8 +653,36 @@ impl Run<'_> {
                 });
                 Some(FOLLOW_INTERVAL)
             }
-            Err(e) => self.fail(&e),
+            Err(e) => {
+                // A node that failed is connected afresh next time.
+                connections.node = None;
+                self.fail(&e)
+            }
         }
+    }
+
+    /// The connection to `node` kept from an earlier round, or a new one.
+    /// A new connection is compared with an independent node once per run.
+    async fn node<'c>(
+        &self,
+        node: &NodeUrl,
+        network: kn_keys::Network,
+        kept: &'c mut Option<NodeConnection>,
+    ) -> Result<(&'c MoneroDaemonHttp, &'c mut SyncCache), SyncError> {
+        if kept.as_ref().is_none_or(|k| k.url != *node) {
+            *kept = None;
+            let (daemon, status) = connect(node, network).await?;
+            if !status.test_chain && !self.opinion_done.swap(true, Ordering::Relaxed) {
+                self.second_opinion(&daemon, node, network).await;
+            }
+            *kept = Some(NodeConnection {
+                url: node.clone(),
+                daemon,
+                cache: SyncCache::default(),
+            });
+        }
+        let kept = kept.as_mut().expect("connected above");
+        Ok((&kept.daemon, &mut kept.cache))
     }
 
     /// Compares the node with a bundled one it is not, once per run. An
@@ -532,7 +714,12 @@ impl Run<'_> {
     /// When the owner asked for it, confirms the server's payments with the
     /// network's node. Returns how many outputs the node contradicted; a
     /// node that cannot be reached confirms nothing and contradicts nothing.
-    async fn confirm_with_node(&self, network: kn_keys::Network, state: &mut SyncState) -> u32 {
+    async fn confirm_with_node(
+        &self,
+        network: kn_keys::Network,
+        state: &mut SyncState,
+        kept: &mut Option<NodeConnection>,
+    ) -> u32 {
         let enabled = crate::node_settings::load().is_ok_and(|s| s.confirm_lws_payments);
         if !enabled {
             return 0;
@@ -542,20 +729,30 @@ impl Run<'_> {
         };
         let before = state.outputs.len();
         let checked = async {
-            let (daemon, _) = connect(&node, network).await?;
-            kn_sync::cross_check(&daemon, state).await
+            if kept.as_ref().is_none_or(|k| k.url != node) {
+                let (daemon, _) = connect(&node, network).await?;
+                *kept = Some(NodeConnection {
+                    url: node.clone(),
+                    daemon,
+                    cache: SyncCache::default(),
+                });
+            }
+            let daemon = &kept.as_ref().expect("connected above").daemon;
+            kn_sync::cross_check(daemon, state).await
         };
-        if tokio::time::timeout(Duration::from_mins(1), checked)
-            .await
-            .is_err()
-        {
-            return 0;
+        match tokio::time::timeout(Duration::from_mins(1), checked).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                *kept = None;
+                return 0;
+            }
+            Err(_) => return 0,
         }
         u32::try_from(before.saturating_sub(state.outputs.len())).unwrap_or(u32::MAX)
     }
 
     /// One request round to the light wallet server.
-    async fn lws_round(&self, setup: &Setup) -> Option<Duration> {
+    async fn lws_round(&self, setup: &Setup, connections: &mut Connections) -> Option<Duration> {
         let Ok(Some(server_url)) = lws_server(setup.network.into()) else {
             self.emit(SyncEvent::failed(SyncFailure::LwsServerNotSet));
             return None;
@@ -579,9 +776,16 @@ impl Run<'_> {
         });
         let mut state = self.inner.sync.snapshot();
         let result = async {
-            let server = LwsServer::new(&url)?;
+            if connections
+                .lws
+                .as_ref()
+                .is_none_or(|(kept, _)| *kept != url)
+            {
+                connections.lws = Some((url.clone(), LwsServer::new(&url)?));
+            }
+            let (_, server) = connections.lws.as_ref().expect("connected above");
             lws_sync(
-                &server,
+                server,
                 &setup.keys,
                 setup.network,
                 &setup.accounts,
@@ -594,16 +798,18 @@ impl Run<'_> {
         .await;
         let result = match result {
             Ok(mut report) => {
-                report.rejected_outputs = report
-                    .rejected_outputs
-                    .saturating_add(self.confirm_with_node(setup.network, &mut state).await);
+                report.rejected_outputs = report.rejected_outputs.saturating_add(
+                    self.confirm_with_node(setup.network, &mut state, &mut connections.node)
+                        .await,
+                );
                 Ok(report)
             }
             Err(e) => Err(e),
         };
         match result {
             Ok(report) => {
-                self.record(&state, report.tip);
+                self.failures.store(0, Ordering::Relaxed);
+                self.record(&state, report.tip, true);
                 let caught_up = report.scanned >= report.tip;
                 self.emit(SyncEvent {
                     scanned: report.scanned,
@@ -622,11 +828,15 @@ impl Run<'_> {
                     LWS_CATCH_UP_INTERVAL
                 })
             }
-            Err(e) => self.fail(&e),
+            Err(e) => {
+                connections.lws = None;
+                self.fail(&e)
+            }
         }
     }
 
-    /// Reports `e`; network trouble is retried, configuration problems stop.
+    /// Reports `e`; network trouble is retried, less often the longer it
+    /// lasts, and configuration problems stop.
     fn fail(&self, e: &SyncError) -> Option<Duration> {
         let failure = match e {
             SyncError::Cancelled => return None,
@@ -639,7 +849,8 @@ impl Run<'_> {
             SyncError::InsecureLws => SyncFailure::InsecureLws,
         };
         self.emit(SyncEvent::failed(failure));
-        (failure == SyncFailure::NodeUnreachable).then_some(FOLLOW_INTERVAL)
+        (failure == SyncFailure::NodeUnreachable)
+            .then(|| retry_interval(self.failures.fetch_add(1, Ordering::Relaxed) + 1))
     }
 }
 
@@ -649,4 +860,100 @@ pub(crate) fn hex_string(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_background_pace_only_lengthens_waits() {
+        assert_eq!(paced(FOLLOW_INTERVAL, true), FOLLOW_INTERVAL);
+        assert_eq!(paced(LWS_CATCH_UP_INTERVAL, true), LWS_CATCH_UP_INTERVAL);
+        assert_eq!(paced(FOLLOW_INTERVAL, false), BACKGROUND_INTERVAL);
+        assert_eq!(
+            paced(Duration::from_mins(20), false),
+            Duration::from_mins(20)
+        );
+    }
+
+    #[test]
+    fn retries_back_off_up_to_a_limit() {
+        let waits: Vec<u64> = (1..=6).map(|n| retry_interval(n).as_secs()).collect();
+        assert_eq!(waits, [30, 60, 120, 240, 300, 300]);
+        assert_eq!(retry_interval(0), FOLLOW_INTERVAL);
+        assert_eq!(retry_interval(u32::MAX), MAX_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn coming_to_the_foreground_wakes_waiting_syncs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            set_sync_pace(false);
+            let woken = PACE.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            set_sync_pace(true);
+            tokio::time::timeout(Duration::from_secs(1), woken)
+                .await
+                .expect("woken");
+        });
+    }
+
+    #[test]
+    fn the_cache_is_written_when_due_and_only_when_changed() {
+        use super::super::wallets::{SyncMode, create_wallet_from_seed, generate_seed};
+        crate::test_store::init();
+        let seed = generate_seed(super::super::wallets::SeedFormat::Polyseed);
+        let wallet = create_wallet_from_seed(
+            "Saves".into(),
+            Network::Stagenet,
+            SyncMode::Full,
+            seed.words.join(" "),
+            "pw".into(),
+            Some(100),
+            true,
+        )
+        .unwrap();
+        let inner = &wallet.inner;
+        let cached = || {
+            inner
+                .with(|w| Ok(store()?.load_cache(w)?))
+                .unwrap()
+                .map(|bytes| SyncState::from_bytes(&bytes).unwrap().next_height)
+        };
+        let id = wallet.summary().unwrap().id;
+
+        // The first change is written at once.
+        inner
+            .sync
+            .update(inner, &SyncState::starting_at(101), false);
+        assert_eq!(cached(), Some(101));
+        // Later ones wait for the interval, or a flush.
+        inner
+            .sync
+            .update(inner, &SyncState::starting_at(102), false);
+        assert_eq!(cached(), Some(101));
+        assert_eq!(inner.sync.read(|s| s.next_height), 102);
+        inner.sync.flush(inner);
+        assert_eq!(cached(), Some(102));
+        // Nothing changed: nothing is written, even when forced.
+        store().unwrap().remove_cache(&id).unwrap();
+        inner.sync.update(inner, &SyncState::starting_at(102), true);
+        assert_eq!(cached(), None);
+        // A forced change is written at once; locking writes what is left.
+        inner.sync.update(inner, &SyncState::starting_at(103), true);
+        assert_eq!(cached(), Some(103));
+        inner
+            .sync
+            .update(inner, &SyncState::starting_at(104), false);
+        assert_eq!(cached(), Some(103));
+        let reopened = inner.with(|w| Ok(w.entry.id.clone())).unwrap();
+        wallet.lock();
+        let again = super::super::wallets::unlock_wallet(reopened, "pw".into()).unwrap();
+        assert_eq!(again.inner.sync.read(|s| s.next_height), 104);
+    }
 }

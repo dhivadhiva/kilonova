@@ -146,7 +146,7 @@ impl OpenWallet {
     }
 
     fn request_row(&self, r: &PaymentRequest, address: &str) -> RequestRow {
-        let (received, arriving) = self.inner.sync.snapshot().received_by(0, r.index);
+        let (received, arriving) = self.inner.sync.read(|s| s.received_by(0, r.index));
         let status = if received >= r.amount {
             RequestStatus::Paid
         } else if arriving > 0 {

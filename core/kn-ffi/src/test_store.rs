@@ -10,3 +10,8 @@ pub(crate) fn init() {
     crate::api::wallets::init_wallet_store(dir.path().to_string_lossy().into_owned())
         .expect("store opens");
 }
+
+#[cfg(test)]
+pub(crate) fn dir() -> std::path::PathBuf {
+    DIR.get().expect("store initialized").path().to_path_buf()
+}
