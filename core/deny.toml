@@ -1,0 +1,87 @@
+# cargo-deny configuration for the kilonova core workspace.
+#
+# Run with `cargo deny check` from `core/`. Install with
+# `cargo install cargo-deny --locked`. See docs/AUDIT-SCOPE.md for how this
+# fits into the audit preparation and docs/RELEASING.md for how CI runs it.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# Dependency licenses. The allow list below is exactly what the workspace's
+# dependency tree uses today (checked with `cargo metadata` against every
+# license expression present), not a generic permissive list. Re-run
+# `cargo deny check licenses` after any dependency change; a new license
+# family shows up as a rejection with the file and crate that introduced it.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # Unicode's data-table license, paired with MIT/Apache-2.0 on
+    # unicode-ident. Only appears as "(MIT OR Apache-2.0) AND
+    # Unicode-DFS-2016".
+    "Unicode-DFS-2016",
+    # Community Data License Agreement, used by a couple of small
+    # data-table crates (e.g. webpki-roots' trust store).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+
+# This section is considered when running `cargo deny check bans`.
+[bans]
+# Two copies of the same crate are common and usually harmless, but for a
+# wallet the crates that matter are the crypto ones: duplicate curve or hash
+# implementations mean two codepaths were audited (or not) instead of one.
+# Kept at "warn" rather than "deny": the monero-oxide tree currently pulls
+# a couple of duplicate transitive versions of ordinary crates (e.g. via
+# differing requirements between reqwest and the monero-* crates) that are
+# not worth blocking CI over, but any duplicate should be visible in the
+# check output.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+# This section is considered when running `cargo deny check sources`.
+# Only the git sources this workspace actually depends on are allowed;
+# anything else (a dependency switched to an unreviewed fork, or a crate
+# pulling in its own git dependency) fails the check instead of silently
+# building.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+# kayabaNerve/monero-wallet-util: monero-seed and monero-wallet, used
+# ahead of a crates.io release of monero-oxide's wallet crates.
+# serai-dex/serai: dependency of monero-oxide's own curve/transcript
+# crates (see Cargo.lock for the exact revs; `cargo deny check sources`
+# re-verifies both against the pinned revs on every run).
+github = ["kayabaNerve", "serai-dex"]
+gitlab = []
+bitbucket = []
+
+# This section is considered when running `cargo deny check advisories`.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0056", reason = "adler v1.0.2 is an unmaintained-but-not-vulnerable transitive dependency pulled in by flutter_rust_bridge's backtrace -> miniz_oxide chain, not by kilonova's own crates. No safe upgrade exists upstream yet (adler2 is a rename, not a drop-in semver-compatible release for miniz_oxide 0.7). Revisit when flutter_rust_bridge bumps backtrace/miniz_oxide." },
+]
