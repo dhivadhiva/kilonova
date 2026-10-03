@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kn_keys::WalletKeys;
 use monero_daemon_rpc::MoneroDaemon;
 use monero_interface::{
-    ProvidesBlockchain as _, ProvidesBlockchainMeta as _, ProvidesScannableBlocks as _,
-    ProvidesTransactions as _, ScannableBlock,
+    ProvidesBlockchain as _, ProvidesBlockchainMeta as _, ProvidesTransactions as _, ScannableBlock,
 };
-use monero_wallet::{Scanner, address::SubaddressIndex, transaction::Input};
+use monero_wallet::{Scanner, address::SubaddressIndex, block::Block, transaction::Input};
 
 use crate::{
     SyncError,
@@ -34,6 +33,27 @@ pub struct Progress {
     pub tip: u64,
 }
 
+/// What a sync keeps between calls with the same node, so following the
+/// tip stays cheap: pool transactions already looked at, and a block to
+/// scan the pool in.
+#[derive(Default)]
+pub struct SyncCache {
+    /// Pool transactions by hash, as last seen.
+    pool: HashMap<[u8; 32], PoolTx>,
+    /// Any block; pool transactions ride in it to be scanned.
+    carrier: Option<Block>,
+}
+
+/// What a pool transaction means for the wallet, kept so it is fetched and
+/// scanned only once while it waits.
+struct PoolTx {
+    /// Every key image it spends; matched against the wallet's own on each
+    /// look, since a cold wallet may supply more of them later.
+    key_images: Vec<[u8; 32]>,
+    /// Payments to this wallet: subaddress and amount.
+    received: Vec<((u32, u32), u64)>,
+}
+
 /// Scans `daemon`'s chain from `state.next_height` to its tip.
 ///
 /// `accounts[i]` is how many subaddresses account `i` has handed out; each
@@ -52,6 +72,32 @@ pub async fn sync(
     accounts: &[u32],
     state: &mut SyncState,
     cancel: &AtomicBool,
+    on_batch: impl FnMut(&SyncState, Progress),
+) -> Result<(), SyncError> {
+    sync_with(
+        daemon,
+        &mut SyncCache::default(),
+        keys,
+        accounts,
+        state,
+        cancel,
+        on_batch,
+    )
+    .await
+}
+
+/// [`sync`], keeping `cache` for the next call with the same node.
+///
+/// # Errors
+///
+/// As [`sync`].
+pub async fn sync_with(
+    daemon: &MoneroDaemon<Http>,
+    cache: &mut SyncCache,
+    keys: &WalletKeys,
+    accounts: &[u32],
+    state: &mut SyncState,
+    cancel: &AtomicBool,
     mut on_batch: impl FnMut(&SyncState, Progress),
 ) -> Result<(), SyncError> {
     let mut scanner = Scanner::new(keys.view_pair());
@@ -65,17 +111,22 @@ pub async fn sync(
         }
     }
 
+    // One request says both how long the chain is and whether the newest
+    // block this wallet scanned is still on it, which is all a wallet at
+    // the tip needs to know.
+    let (top, top_hash) = last_block(daemon).await?;
+    let mut tip = top + 1;
+    if state.recent.back() != Some(&(top, top_hash)) {
+        rewind_if_reorganized(daemon, state).await?;
+    }
     let mut owned = key_image_index(state);
     let mut by_output_key = output_key_index(state);
+    // Whether `tip` was asked for since the last batch was scanned.
+    let mut tip_is_fresh = true;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(SyncError::Cancelled);
-        }
-        let tip = to_u64(daemon.latest_block_number().await?)? + 1;
-        if rewind_if_reorganized(daemon, state).await? {
-            owned = key_image_index(state);
-            by_output_key = output_key_index(state);
         }
         on_batch(
             state,
@@ -85,16 +136,44 @@ pub async fn sync(
             },
         );
         if state.next_height >= tip {
+            if !tip_is_fresh {
+                // Blocks may have arrived while scanning.
+                tip = to_u64(daemon.latest_block_number().await?)? + 1;
+                tip_is_fresh = true;
+                if state.next_height < tip {
+                    continue;
+                }
+            }
             state.expire_pending(tip);
             // The pool is a convenience: a node that will not show it does
             // not stop sync.
-            let _ = scan_pool(daemon, &mut scanner, state, &owned, tip).await;
+            let _ = scan_pool(daemon, cache, &mut scanner, state, &owned, tip).await;
             return Ok(());
         }
         let end = (state.next_height + BATCH).min(tip) - 1;
-        let blocks = daemon
-            .contiguous_scannable_blocks(to_usize(state.next_height)?..=to_usize(end)?)
-            .await?;
+        let blocks =
+            crate::blocks::scannable_blocks(daemon, to_usize(state.next_height)?..=to_usize(end)?)
+                .await?;
+        // A first block that does not build on the last one scanned means
+        // the node's chain changed since: find where, and go on from there.
+        if let (Some(first), Some(&(height, hash))) = (blocks.first(), state.recent.back())
+            && to_u64(first.block.number())? == height + 1
+            && first.block.header.previous != hash
+        {
+            if !rewind_if_reorganized(daemon, state).await? {
+                return Err(SyncError::Node(
+                    "the node's blocks do not agree with its block hashes".into(),
+                ));
+            }
+            owned = key_image_index(state);
+            by_output_key = output_key_index(state);
+            tip = to_u64(daemon.latest_block_number().await?)? + 1;
+            continue;
+        }
+        tip_is_fresh = false;
+        if let Some(last) = blocks.last() {
+            cache.carrier = Some(last.block.clone());
+        }
         for block in blocks {
             let height = state.next_height;
             scan_block(
@@ -108,6 +187,30 @@ pub async fn sync(
             )?;
         }
     }
+}
+
+/// Height and hash of the node's newest block.
+async fn last_block(daemon: &MoneroDaemon<Http>) -> Result<(u64, [u8; 32]), SyncError> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        block_header: Header,
+    }
+    #[derive(serde::Deserialize)]
+    struct Header {
+        height: u64,
+        hash: String,
+    }
+    let reply = daemon
+        .json_rpc_call("get_last_block_header", None, 4096)
+        .await?;
+    let header = serde_json::from_str::<Reply>(&reply)
+        .map_err(|_| SyncError::Node("unexpected get_last_block_header response".into()))?
+        .block_header;
+    let hash = hex::decode(&header.hash)
+        .ok()
+        .and_then(|h| h.try_into().ok())
+        .ok_or_else(|| SyncError::Node("unexpected block hash".into()))?;
+    Ok((header.height, hash))
 }
 
 fn scan_block(
@@ -184,9 +287,11 @@ const POOL_LIMIT: usize = 500;
 
 /// Records payments to this wallet in the node's transaction pool, and
 /// marks outputs that pool transactions spend (sent from another device
-/// with the same seed) as pending spends.
+/// with the same seed) as pending spends. Only transactions not seen on an
+/// earlier look are fetched.
 async fn scan_pool(
     daemon: &MoneroDaemon<Http>,
+    cache: &mut SyncCache,
     scanner: &mut Scanner,
     state: &mut SyncState,
     owned: &HashMap<[u8; 32], usize>,
@@ -207,74 +312,126 @@ async fn scan_pool(
         .filter_map(|h| hex::decode(h).ok()?.try_into().ok())
         .take(POOL_LIMIT)
         .collect();
+    // Forget what left the pool.
+    cache.pool.retain(|hash, _| hashes.contains(hash));
     if hashes.is_empty() {
         state.pool.clear();
         return Ok(());
     }
-    let transactions = daemon
-        .pruned_transactions(&hashes)
-        .await
-        .map_err(|e| SyncError::Node(format!("pool: {e:?}")))?;
-    for (tx, hash) in transactions.iter().zip(&hashes) {
-        let spent: Vec<[u8; 32]> = tx
-            .prefix()
-            .inputs
-            .iter()
-            .filter_map(|input| match input {
-                Input::ToKey { key_image, .. } => Some(key_image.to_bytes()),
-                Input::Gen(_) => None,
-            })
-            .filter(|ki| owned.contains_key(ki))
-            .collect();
-        state.mark_pending(&spent, *hash, tip);
-    }
 
-    // The scanner only reads blocks, so the pool transactions ride in the
-    // latest block in place of its own. Output positions on the chain are
-    // unknown until mined, which is fine: these outputs are only shown.
-    let mut carrier = daemon.scannable_block_by_number(to_usize(tip - 1)?).await?;
-    carrier.block.transactions.clone_from(&hashes);
-    carrier.transactions = transactions;
-    carrier.output_index_for_first_ringct_output = Some(0);
-    let found = scanner
-        .scan(carrier)
-        .map_err(|e| SyncError::Node(format!("pool could not be scanned: {e}")))?;
+    let new: Vec<[u8; 32]> = hashes
+        .iter()
+        .filter(|h| !cache.pool.contains_key(*h))
+        .copied()
+        .collect();
+    if !new.is_empty() {
+        learn_pool_transactions(daemon, cache, scanner, &new, tip).await?;
+    }
 
     let mut payments: Vec<PoolPayment> = Vec::new();
-    for output in found.ignore_additional_timelock() {
-        let tx = output.transaction();
-        if !hashes.contains(&tx) {
-            continue; // the carrier block's miner output
-        }
-        let index = output
-            .subaddress()
-            .map_or((0, 0), |s| (s.account(), s.address()));
-        let amount = output.commitment().amount;
-        let payment = if let Some(p) = payments.iter_mut().find(|p| p.tx == tx) {
-            p
-        } else {
-            payments.push(PoolPayment {
-                tx,
-                amount: 0,
-                subaddresses: Vec::new(),
-                by_subaddress: Vec::new(),
-            });
-            payments.last_mut().expect("just pushed")
+    for hash in &hashes {
+        let Some(tx) = cache.pool.get(hash) else {
+            continue;
         };
-        payment.amount = payment.amount.saturating_add(amount);
-        if !payment.subaddresses.contains(&index) {
-            payment.subaddresses.push(index);
+        let spent: Vec<[u8; 32]> = tx
+            .key_images
+            .iter()
+            .filter(|ki| owned.contains_key(*ki))
+            .copied()
+            .collect();
+        state.mark_pending(&spent, *hash, tip);
+        if tx.received.is_empty() {
+            continue;
         }
-        match payment
-            .by_subaddress
-            .iter_mut()
-            .find(|(at, _)| *at == index)
-        {
-            Some((_, sum)) => *sum = sum.saturating_add(amount),
-            None => payment.by_subaddress.push((index, amount)),
+        let mut payment = PoolPayment {
+            tx: *hash,
+            amount: 0,
+            subaddresses: Vec::new(),
+            by_subaddress: Vec::new(),
+        };
+        for &(index, amount) in &tx.received {
+            payment.amount = payment.amount.saturating_add(amount);
+            if !payment.subaddresses.contains(&index) {
+                payment.subaddresses.push(index);
+            }
+            match payment
+                .by_subaddress
+                .iter_mut()
+                .find(|(at, _)| *at == index)
+            {
+                Some((_, sum)) => *sum = sum.saturating_add(amount),
+                None => payment.by_subaddress.push((index, amount)),
+            }
         }
+        payments.push(payment);
     }
     state.pool = payments;
+    Ok(())
+}
+
+/// Fetches and scans pool transactions not seen before, into `cache`.
+async fn learn_pool_transactions(
+    daemon: &MoneroDaemon<Http>,
+    cache: &mut SyncCache,
+    scanner: &mut Scanner,
+    new: &[[u8; 32]],
+    tip: u64,
+) -> Result<(), SyncError> {
+    let transactions = daemon
+        .pruned_transactions(new)
+        .await
+        .map_err(|e| SyncError::Node(format!("pool: {e:?}")))?;
+    let key_images: Vec<Vec<[u8; 32]>> = transactions
+        .iter()
+        .map(|tx| {
+            tx.prefix()
+                .inputs
+                .iter()
+                .filter_map(|input| match input {
+                    Input::ToKey { key_image, .. } => Some(key_image.to_bytes()),
+                    Input::Gen(_) => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    // The scanner only reads blocks, so the pool transactions ride in a
+    // block in place of its own. Output positions on the chain are
+    // unknown until mined, which is fine: these outputs are only shown.
+    let mut carrier = if let Some(block) = &cache.carrier {
+        block.clone()
+    } else {
+        let block = daemon.block_by_number(to_usize(tip - 1)?).await?;
+        cache.carrier = Some(block.clone());
+        block
+    };
+    carrier.transactions = new.to_vec();
+    let found = scanner.scan(ScannableBlock {
+        block: carrier,
+        transactions,
+        output_index_for_first_ringct_output: Some(0),
+    });
+    let found = found.map_err(|e| SyncError::Node(format!("pool could not be scanned: {e}")))?;
+    for (hash, key_images) in new.iter().zip(key_images) {
+        cache.pool.insert(
+            *hash,
+            PoolTx {
+                key_images,
+                received: Vec::new(),
+            },
+        );
+    }
+    for output in found.ignore_additional_timelock() {
+        // Anything else is the carrier block's miner output.
+        if let Some(tx) = cache.pool.get_mut(&output.transaction())
+            && new.contains(&output.transaction())
+        {
+            let index = output
+                .subaddress()
+                .map_or((0, 0), |s| (s.account(), s.address()));
+            tx.received.push((index, output.commitment().amount));
+        }
+    }
     Ok(())
 }
 

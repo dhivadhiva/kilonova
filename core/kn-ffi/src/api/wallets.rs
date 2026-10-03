@@ -576,6 +576,8 @@ impl OpenWallet {
     #[frb(sync)]
     pub fn lock(&self) {
         self.inner.sync.stop();
+        // Keep what was scanned since the cache was last written.
+        self.inner.sync.flush(&self.inner);
         let mut guard = self
             .inner
             .wallet

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod blocks;
 mod crosscheck;
 mod discover;
 mod lws;
@@ -33,7 +34,7 @@ pub use opinion::{OPINION_DEPTH, Opinion, second_opinion};
 pub use price::{PRICE_CURRENCIES, PRICE_SOURCE, xmr_price};
 pub use proof::{ProofError, ProofResult, check_tx_key};
 pub use restore_height::approximate_height;
-pub use scan::{Progress, SUBADDRESS_LOOKAHEAD, sync};
+pub use scan::{Progress, SUBADDRESS_LOOKAHEAD, SyncCache, sync, sync_with};
 pub use state::{
     Balance, DEFAULT_LOCK_BLOCKS, Direction, HistoryEntry, MINER_LOCK_BLOCKS, OwnedOutput,
     PENDING_EXPIRY_BLOCKS, PoolPayment, Spend, SyncState,
