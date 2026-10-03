@@ -7,8 +7,10 @@ import '../../widgets/amount.dart';
 import '../../widgets/kn_card.dart';
 import '../../widgets/kn_icons.dart';
 
-/// Transactions, newest first, as a card of rows. Empty state is one line,
-/// no card.
+/// Transactions, newest first, as a lazy sliver card of rows: only the rows
+/// near the viewport are ever built, so a history of thousands of entries
+/// costs no more than a short one. Empty state is one line, no card. Place
+/// directly among the `slivers` of a [CustomScrollView].
 class HistoryList extends StatelessWidget {
   const HistoryList({super.key, required this.items, this.onOpen});
 
@@ -21,22 +23,22 @@ class HistoryList extends StatelessWidget {
   Widget build(BuildContext context) {
     final l = AppLocalizations.of(context);
     if (items.isEmpty) {
-      return Text(
-        l.historyEmpty,
-        style: Theme.of(context).textTheme.bodyMedium,
+      return SliverToBoxAdapter(
+        child: Text(
+          l.historyEmpty,
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
       );
     }
-    return KnCard(
-      padding: EdgeInsets.zero,
-      child: Column(
-        children: withDividers([
-          for (final item in items)
-            _HistoryRow(
-              item: item,
-              onTap: onOpen == null ? null : () => onOpen!(item),
-            ),
-        ]),
-      ),
+    return SliverKnCard(
+      itemCount: items.length,
+      itemBuilder: (context, i) {
+        final item = items[i];
+        return _HistoryRow(
+          item: item,
+          onTap: onOpen == null ? null : () => onOpen!(item),
+        );
+      },
     );
   }
 }

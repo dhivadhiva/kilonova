@@ -43,6 +43,62 @@ class WalletView extends StatefulWidget {
 }
 
 class _WalletViewState extends State<WalletView> {
+  // The wallet page used to call summary(), requests(), history() and
+  // coinsWithoutKeyImages() straight from build(), every time any sync
+  // event arrived (progress pings included). On a wallet with a long
+  // history that is real, repeated FFI work for data that has not changed.
+  // Instead, the sync listenable is watched by hand: every event still
+  // redraws the sync line (cheap), but the FFI-backed fields below are
+  // only refetched when the scanned height actually moves, or after an
+  // action here that is known to have changed them.
+  late WalletSummary _summary = widget.wallet.summary();
+  SyncEvent? _event;
+  List<HistoryItem> _history = const [];
+  List<RequestRow> _requests = const [];
+  int _needsKeyImages = 0;
+  BigInt? _dataHeight;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+    if (!_summary.cold) {
+      _event = widget.registry.syncOf(_summary.id).value;
+      widget.registry.syncOf(_summary.id).addListener(_onSyncEvent);
+    }
+  }
+
+  @override
+  void dispose() {
+    if (!_summary.cold) {
+      widget.registry.syncOf(_summary.id).removeListener(_onSyncEvent);
+    }
+    super.dispose();
+  }
+
+  void _loadData() {
+    _summary = widget.wallet.summary();
+    if (_summary.cold) return;
+    _history = widget.wallet.history();
+    _requests = widget.wallet.requests();
+    _needsKeyImages = _summary.viewOnly
+        ? widget.wallet.coinsWithoutKeyImages()
+        : 0;
+  }
+
+  void _onSyncEvent() {
+    final event = widget.registry.syncOf(_summary.id).value;
+    final height = event?.scanned;
+    final changed = height != _dataHeight;
+    setState(() {
+      _event = event;
+      if (changed) {
+        _dataHeight = height;
+        _loadData();
+      }
+    });
+  }
+
   Future<void> _send() async {
     final l = AppLocalizations.of(context);
     final sent = await Navigator.of(context).push<bool>(
@@ -52,7 +108,7 @@ class _WalletViewState extends State<WalletView> {
       ),
     );
     if (sent != true || !mounted) return;
-    setState(() {});
+    setState(_loadData);
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(l.sentNotice)));
@@ -67,7 +123,7 @@ class _WalletViewState extends State<WalletView> {
 
   Future<void> _syncWithOffline() async {
     await coldSyncWithOffline(context, widget.wallet, widget.registry);
-    if (mounted) setState(() {});
+    if (mounted) setState(_loadData);
   }
 
   Widget _header(BuildContext context, WalletSummary summary) {
@@ -145,130 +201,131 @@ class _WalletViewState extends State<WalletView> {
   Widget build(BuildContext context) {
     final l = AppLocalizations.of(context);
     final text = Theme.of(context).textTheme;
-    final summary = widget.wallet.summary();
+    final summary = _summary;
 
     if (summary.cold) return _coldBody(context, summary);
 
-    return ValueListenableBuilder<SyncEvent?>(
-      valueListenable: widget.registry.syncOf(summary.id),
-      builder: (context, event, _) {
-        // Recomputed on every sync event, so the card appears as soon as
-        // the watching wallet has scanned coins it cannot derive key
-        // images for.
-        final needsKeyImages = summary.viewOnly
-            ? widget.wallet.coinsWithoutKeyImages()
-            : 0;
-        return ListView(
-          padding: EdgeInsets.zero,
-          children: [
-            _header(context, summary),
-            const SizedBox(height: KnSpace.xl),
-            BalanceBlock(
-              wallet: widget.wallet,
-              prices: summary.network.isTestNetwork()
-                  ? null
-                  : widget.registry.price,
-            ),
-            const SizedBox(height: KnSpace.lg),
-            if (needsKeyImages > 0) ...[
-              KnCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      l.coldSyncNeededCard(needsKeyImages),
-                      style: text.bodyMedium,
-                    ),
-                    const SizedBox(height: KnSpace.sm),
-                    KnButton.secondary(
-                      l.coldSyncWithOfflineAction,
-                      onPressed: _syncWithOffline,
-                    ),
-                  ],
-                ),
+    final requests = _requests;
+
+    return CustomScrollView(
+      slivers: [
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _header(context, summary),
+              const SizedBox(height: KnSpace.xl),
+              BalanceBlock(
+                wallet: widget.wallet,
+                prices: summary.network.isTestNetwork()
+                    ? null
+                    : widget.registry.price,
               ),
               const SizedBox(height: KnSpace.lg),
-            ],
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                KnButton.primary(
-                  l.sendAction,
-                  icon: const KnIcon(KnIcons.send),
-                  onPressed: _send,
-                ),
-                const SizedBox(width: KnSpace.sm),
-                KnButton.secondary(
-                  l.receiveTitle,
-                  icon: const KnIcon(KnIcons.receive),
-                  onPressed: _receive,
-                ),
-              ],
-            ),
-            const SizedBox(height: KnSpace.lg),
-            SyncLine(
-              wallet: widget.wallet,
-              event: event,
-              onRetry: () => widget.registry.startSync(summary.id),
-              registry: widget.registry,
-            ),
-            if (widget.wallet.requests().isNotEmpty) ...[
-              const SizedBox(height: KnSpace.xl),
-              Eyebrow(l.requestsTitle),
-              const SizedBox(height: KnSpace.sm),
-              KnCard(
-                padding: EdgeInsets.zero,
-                child: Column(
-                  children: withDividers([
-                    for (final r in widget.wallet.requests())
-                      KnRow(
-                        title: Text(
-                          r.label.isEmpty ? l.requestDefaultLabel : r.label,
-                        ),
-                        subtitle: Text(
-                          requestStatusText(context, r),
-                          style: r.status == RequestStatus.paid
-                              ? TextStyle(color: context.kn.received)
-                              : null,
-                        ),
-                        trailing: AmountText(r.amount),
-                        onTap: () async {
-                          await Navigator.of(context).push(
-                            MaterialPageRoute<void>(
-                              builder: (_) => RequestScreen(
-                                wallet: widget.wallet,
-                                request: r,
-                              ),
-                            ),
-                          );
-                          if (mounted) setState(() {});
-                        },
+              if (_needsKeyImages > 0) ...[
+                KnCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        l.coldSyncNeededCard(_needsKeyImages),
+                        style: text.bodyMedium,
                       ),
-                  ]),
+                      const SizedBox(height: KnSpace.sm),
+                      KnButton.secondary(
+                        l.coldSyncWithOfflineAction,
+                        onPressed: _syncWithOffline,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: KnSpace.lg),
+              ],
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  KnButton.primary(
+                    l.sendAction,
+                    icon: const KnIcon(KnIcons.send),
+                    onPressed: _send,
+                  ),
+                  const SizedBox(width: KnSpace.sm),
+                  KnButton.secondary(
+                    l.receiveTitle,
+                    icon: const KnIcon(KnIcons.receive),
+                    onPressed: _receive,
+                  ),
+                ],
+              ),
+              const SizedBox(height: KnSpace.lg),
+              RepaintBoundary(
+                child: SyncLine(
+                  wallet: widget.wallet,
+                  event: _event,
+                  onRetry: () => widget.registry.startSync(summary.id),
+                  registry: widget.registry,
                 ),
               ),
+              if (requests.isNotEmpty) ...[
+                const SizedBox(height: KnSpace.xl),
+                Eyebrow(l.requestsTitle),
+                const SizedBox(height: KnSpace.sm),
+              ],
             ],
-            const SizedBox(height: KnSpace.xl),
-            Eyebrow(l.historyTitle),
-            const SizedBox(height: KnSpace.sm),
-            HistoryList(
-              items: widget.wallet.history(),
-              onOpen: (item) async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => TxDetailsScreen(
-                      wallet: widget.wallet,
-                      item: item,
-                      biometric: widget.registry.biometric,
+          ),
+        ),
+        if (requests.isNotEmpty)
+          SliverKnCard(
+            itemCount: requests.length,
+            itemBuilder: (context, i) {
+              final r = requests[i];
+              return KnRow(
+                title: Text(r.label.isEmpty ? l.requestDefaultLabel : r.label),
+                subtitle: Text(
+                  requestStatusText(context, r),
+                  style: r.status == RequestStatus.paid
+                      ? TextStyle(color: context.kn.received)
+                      : null,
+                ),
+                trailing: AmountText(r.amount),
+                onTap: () async {
+                  await Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) =>
+                          RequestScreen(wallet: widget.wallet, request: r),
                     ),
-                  ),
-                );
-                if (mounted) setState(() {});
-              },
-            ),
-          ],
-        );
-      },
+                  );
+                  if (mounted) setState(_loadData);
+                },
+              );
+            },
+          ),
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: KnSpace.xl),
+              Eyebrow(l.historyTitle),
+              const SizedBox(height: KnSpace.sm),
+            ],
+          ),
+        ),
+        HistoryList(
+          items: _history,
+          onOpen: (item) async {
+            await Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => TxDetailsScreen(
+                  wallet: widget.wallet,
+                  item: item,
+                  biometric: widget.registry.biometric,
+                ),
+              ),
+            );
+            if (mounted) setState(_loadData);
+          },
+        ),
+      ],
     );
   }
 }

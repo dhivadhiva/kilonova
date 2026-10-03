@@ -95,35 +95,39 @@ class _CoinsScreenState extends State<CoinsScreen> {
                         padding: const EdgeInsets.all(KnSpace.lg),
                         child: Text(l.coinsEmpty, style: text.bodyMedium),
                       )
-                    : ListView(
-                        padding: const EdgeInsets.all(KnSpace.lg),
-                        children: [
-                          KnCard(
-                            padding: EdgeInsets.zero,
-                            child: Column(
-                              children: withDividers([
-                                for (final coin in _coins)
-                                  KnRow(
-                                    leading: Checkbox(
-                                      value: _selected.contains(coin.key),
-                                      onChanged: coin.frozen || coin.locked
-                                          ? null
-                                          : (_) => _toggleSelected(coin),
-                                    ),
-                                    title: AmountText(coin.amount),
-                                    subtitle: Text(_subtitle(context, coin)),
-                                    trailing: KnIconButton(
-                                      icon: const Icon(Icons.ac_unit),
-                                      tooltip: coin.frozen
-                                          ? l.coinsUnfreezeTooltip
-                                          : l.coinsFreezeTooltip,
-                                      onPressed: () => _toggleFrozen(coin),
-                                    ),
-                                    onTap: coin.frozen || coin.locked
+                    // A long-lived wallet can accumulate thousands of
+                    // coins; CustomScrollView + SliverKnCard builds only
+                    // the rows near the viewport, instead of every row up
+                    // front.
+                    : CustomScrollView(
+                        slivers: [
+                          SliverPadding(
+                            padding: const EdgeInsets.all(KnSpace.lg),
+                            sliver: SliverKnCard(
+                              itemCount: _coins.length,
+                              itemBuilder: (context, i) {
+                                final coin = _coins[i];
+                                return KnRow(
+                                  leading: Checkbox(
+                                    value: _selected.contains(coin.key),
+                                    onChanged: coin.frozen || coin.locked
                                         ? null
-                                        : () => _toggleSelected(coin),
+                                        : (_) => _toggleSelected(coin),
                                   ),
-                              ]),
+                                  title: AmountText(coin.amount),
+                                  subtitle: Text(_subtitle(context, coin)),
+                                  trailing: KnIconButton(
+                                    icon: const Icon(Icons.ac_unit),
+                                    tooltip: coin.frozen
+                                        ? l.coinsUnfreezeTooltip
+                                        : l.coinsFreezeTooltip,
+                                    onPressed: () => _toggleFrozen(coin),
+                                  ),
+                                  onTap: coin.frozen || coin.locked
+                                      ? null
+                                      : () => _toggleSelected(coin),
+                                );
+                              },
                             ),
                           ),
                         ],

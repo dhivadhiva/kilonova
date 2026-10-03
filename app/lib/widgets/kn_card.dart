@@ -36,6 +36,47 @@ class KnCard extends StatelessWidget {
   }
 }
 
+/// The lazy version of [KnCard] for a long list of rows: the same opaque
+/// `surface` block, hairline outline and dividers, but as a sliver whose
+/// rows are only built near the viewport. Place directly among the
+/// `slivers` of a [CustomScrollView]; does not take its own padding (wrap
+/// in [SliverPadding] if needed).
+class SliverKnCard extends StatelessWidget {
+  const SliverKnCard({super.key, required this.itemCount, required this.itemBuilder});
+
+  final int itemCount;
+
+  /// Builds the row at [index]; dividers between rows are added for you.
+  final Widget Function(BuildContext context, int index) itemBuilder;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.kn;
+    return DecoratedSliver(
+      decoration: BoxDecoration(
+        color: c.surface,
+        border: Border.all(color: c.border),
+        borderRadius: BorderRadius.circular(KnRadius.md),
+      ),
+      sliver: SliverList(
+        delegate: SliverChildBuilderDelegate(
+          (context, i) => Material(
+            type: MaterialType.transparency,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (i > 0) const KnDivider(),
+                itemBuilder(context, i),
+              ],
+            ),
+          ),
+          childCount: itemCount,
+        ),
+      ),
+    );
+  }
+}
+
 /// A 1px `border` hairline.
 class KnDivider extends StatelessWidget {
   const KnDivider({super.key, this.indent = 0});
