@@ -17,6 +17,7 @@ curve25519-dalek = { version = "4", default-features = false, features = ["alloc
 hex = "0.4"
 kn-keys = { path = "../kn-keys" }
 monero-daemon-rpc = { version = "=0.2.0", features = ["std"] }
+monero-epee = { version = "=0.2.1", default-features = false }
 monero-interface = { version = "=0.2.0", features = ["std"] }
 monero-wallet = { version = "=0.2.0", default-features = false, features = ["std", "compile-time-generators"] }
 # `rustls-no-provider` keeps aws-lc out (it is hard to cross-compile for

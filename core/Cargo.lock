@@ -1145,6 +1145,7 @@ dependencies = [
  "hex",
  "kn-keys",
  "monero-daemon-rpc",
+ "monero-epee",
  "monero-interface",
  "monero-wallet",
  "rand_core",
