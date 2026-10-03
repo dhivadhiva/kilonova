@@ -14,8 +14,23 @@ permissions:
 env:
   FLUTTER_VERSION: 3.44.6
   CARGO_TERM_COLOR: always
+  # Incremental compilation caches are keyed by absolute paths and are not
+  # reproducible between machines; keep it off everywhere in this workflow.
+  CARGO_INCREMENTAL: 0
   # Trial runs from a branch get a version packaging tools accept.
   VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('0.0.0~{0}', github.sha) }}
+  # Rust embeds the absolute path of the workspace and of Cargo's own
+  # registry/git checkouts into debug info and panic messages even in a
+  # stripped release binary. Remapping both to fixed strings (set per job
+  # below, as RUSTFLAGS or, on Android, CARGO_ENCODED_RUSTFLAGS -- cargo
+  # refuses both being set at once, and cargokit's Android build already
+  # uses the encoded form) is what makes the Linux tarball's kn_ffi library
+  # and the arm64 APK's libkn_ffi.so byte-identical regardless of which
+  # runner or which directory the repo was checked out into. CARGO_HOME is
+  # pinned to a path under the workspace for the same reason: left
+  # default, it resolves to $RUNNER_TEMP or $HOME, which differ between
+  # runners.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
 
 jobs:
   android:
@@ -23,6 +38,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reproducible build flags
+        # cargokit's Android build sets CARGO_ENCODED_RUSTFLAGS itself (NDK
+        # linker workarounds) and reads any value already in the
+        # environment to append to it, so the remap-path-prefix flags go
+        # here, \x1f-separated as cargo's encoded form expects, rather than
+        # in plain RUSTFLAGS (cargo refuses both being set at once).
+        run: |
+          sep=$'\x1f'
+          flags="--remap-path-prefix=${{ github.workspace }}=/build${sep}--remap-path-prefix=${{ github.workspace }}/.cargo-home=/cargo-home"
+          echo "CARGO_ENCODED_RUSTFLAGS=$flags" >> "$GITHUB_ENV"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
@@ -66,6 +91,12 @@ jobs:
   linux:
     name: Linux tarball and .deb
     runs-on: ubuntu-24.04
+    env:
+      # cargokit's desktop build makes no changes to the environment it is
+      # launched with, so plain RUSTFLAGS reaches cargo unmodified here
+      # (unlike the Android job, where cargokit's own NDK setup speaks
+      # CARGO_ENCODED_RUSTFLAGS instead).
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=${{ github.workspace }}/.cargo-home=/cargo-home
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build dependencies
@@ -85,9 +116,18 @@ jobs:
         run: |
           version="${VERSION#v}"
           mkdir dist
-          tar -C app/build/linux/x64/release -czf "dist/kilonova-$version-linux-x64.tar.gz" \
-            --transform "s,^bundle,kilonova-$version," bundle
-          packaging/linux/build-deb.sh "$version" app/build/linux/x64/release/bundle dist
+          # Reproducible tarball: fixed member order, a fixed mtime taken
+          # from the commit being released rather than "now", numeric
+          # root ownership, and a gzip header with no embedded name or
+          # timestamp (-n). See tools/repro-check.sh and
+          # docs/RELEASING.md#reproducibility.
+          source_date_epoch="$(git log -1 --format=%ct)"
+          tar -C app/build/linux/x64/release \
+            --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+            --transform "s,^bundle,kilonova-$version," \
+            -cf - bundle | gzip -n -9 > "dist/kilonova-$version-linux-x64.tar.gz"
+          SOURCE_DATE_EPOCH="$source_date_epoch" \
+            packaging/linux/build-deb.sh "$version" app/build/linux/x64/release/bundle dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux
@@ -96,6 +136,12 @@ jobs:
   windows:
     name: Windows zip and installer
     runs-on: windows-2025
+    env:
+      # Same remap as the Linux job, for the native kn_ffi.dll's debug
+      # info and panic strings. This does not make the .zip or the
+      # installer themselves byte-reproducible (Compress-Archive and Inno
+      # Setup both embed file timestamps); see docs/RELEASING.md.
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=${{ github.workspace }}/.cargo-home=/cargo-home
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -107,6 +153,36 @@ jobs:
         run: rustup show active-toolchain; if ($LASTEXITCODE -ne 0) { rustup toolchain install }
       - working-directory: app
         run: flutter build windows --release
+      - name: Signing certificate
+        # Optional: skipped cleanly (installers and the zip ship unsigned,
+        # as RELEASING.md tells users to expect) when no certificate is in
+        # repository secrets. See docs/RELEASING.md#windows-code-signing
+        # for how to obtain and add one.
+        env:
+          CERT: ${{ secrets.KN_WIN_CERT_BASE64 }}
+        run: |
+          if (-not $env:CERT) {
+            Write-Host "KN_WIN_CERT_BASE64 not set; shipping this build unsigned."
+            "KN_SIGN=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
+          $bytes = [Convert]::FromBase64String($env:CERT)
+          $certPath = Join-Path $env:RUNNER_TEMP "kn-signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, $bytes)
+          "KN_SIGN=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KN_CERT_PATH=$certPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Sign the app binaries
+        if: env.KN_SIGN == '1'
+        env:
+          KN_WIN_CERT_PASSWORD: ${{ secrets.KN_WIN_CERT_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 -ExpandProperty FullName
+          $release = "app\build\windows\x64\runner\Release"
+          $targets = Get-ChildItem -Path $release -Recurse -Include *.exe, *.dll | ForEach-Object { $_.FullName }
+          & $signtool sign /f "$env:KN_CERT_PATH" /p "$env:KN_WIN_CERT_PASSWORD" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package
         run: |
           $version = "$env:VERSION".TrimStart('v') -replace '~', '-'
@@ -116,6 +192,20 @@ jobs:
           choco install innosetup --no-progress -y
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=$PWD\$release" "/DOutputDir=$PWD\dist" packaging\windows\kilonova.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sign the installer
+        if: env.KN_SIGN == '1'
+        env:
+          KN_WIN_CERT_PASSWORD: ${{ secrets.KN_WIN_CERT_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 -ExpandProperty FullName
+          $version = "$env:VERSION".TrimStart('v') -replace '~', '-'
+          & $signtool sign /f "$env:KN_CERT_PATH" /p "$env:KN_WIN_CERT_PASSWORD" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "dist\kilonova-$version-windows-x64-setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Remove the signing certificate
+        if: always()
+        run: Remove-Item -Path "$env:RUNNER_TEMP\kn-signing.pfx" -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows

@@ -1,0 +1,30 @@
+name: Flatpak
+
+# Sanity-checks the Flatpak manifest by actually building it, the same way
+# a Flathub PR would. This is not a Flathub submission (see
+# packaging/flatpak/README.md for that); it only catches a broken manifest
+# or a stale tarball checksum before either reaches a real submission.
+on:
+  pull_request:
+    paths:
+      - 'packaging/flatpak/**'
+      - '.github/workflows/flatpak.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build manifest
+    runs-on: ubuntu-24.04
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome
+      options: --privileged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          bundle: kilonova.flatpak
+          manifest-path: packaging/flatpak/com.dhivalabs.kilonova.yml
+          cache: false

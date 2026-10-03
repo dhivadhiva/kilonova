@@ -1,0 +1,172 @@
+name: Reproducible builds
+
+# Builds the Linux tarball and the arm64 APK on two separate runners and
+# checks they come out byte-identical. Unlike tools/repro-check.sh (which
+# only proves the Linux build is path-independent on one machine), this is
+# the real test: two different runners, different machines entirely.
+#
+# Runs on tags (so a release's reproducibility is on record) and by hand.
+# It does not gate the Release workflow: it reports, the way fuzz.yml does,
+# rather than blocking a release on a runner-to-runner difference that may
+# turn out to be a new, unfixed source of nondeterminism.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.44.6
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+
+jobs:
+  keystore:
+    name: Throwaway signing key
+    # app/android/app/build.gradle.kts falls back to the debug signing
+    # config when no release key is given, and a debug keystore is
+    # normally generated on first use with a random key -- fine for local
+    # development, but it would make the two runners' signature bytes
+    # differ for a reason that has nothing to do with whether the build
+    # itself is reproducible. Generating one throwaway key here and
+    # sharing it as a build artifact with both Android runners isolates
+    # that: the comparison then only reflects the build output, not two
+    # independently-randomised keys. This key is not the release signing
+    # key, is not a secret, is never used to sign anything users install,
+    # and a new one is generated every run.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate
+        run: |
+          keytool -genkeypair -v -keystore repro-check.jks -alias reproCheck \
+            -keyalg RSA -keysize 2048 -validity 1 \
+            -storepass reproCheck -keypass reproCheck \
+            -dname "CN=Kilonova reproducible-builds check, O=Dhiva Labs"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: repro-keystore
+          path: repro-check.jks
+          retention-days: 1
+
+  linux:
+    name: Linux tarball (runner ${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [1, 2]
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=${{ github.workspace }}/.cargo-home=/cargo-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - name: Install pinned toolchain
+        working-directory: core
+        run: rustup show active-toolchain || rustup toolchain install
+      - working-directory: app
+        run: flutter build linux --release
+      - name: Package
+        run: |
+          mkdir dist
+          source_date_epoch="$(git log -1 --format=%ct)"
+          tar -C app/build/linux/x64/release \
+            --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+            --transform 's,^bundle,kilonova,' \
+            -cf - bundle | gzip -n -9 > dist/kilonova-linux-x64.tar.gz
+          sha256sum dist/kilonova-linux-x64.tar.gz | tee dist/kilonova-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-${{ matrix.runner }}
+          path: dist/
+
+  android:
+    name: arm64 APK (runner ${{ matrix.runner }})
+    needs: [keystore]
+    strategy:
+      matrix:
+        runner: [1, 2]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: repro-keystore
+          path: ${{ runner.temp }}
+      - name: Reproducible build flags
+        # See the same step in release.yml: cargokit's Android build reads
+        # CARGO_ENCODED_RUSTFLAGS from the environment and appends to it,
+        # so the remap has to be set this way rather than as plain
+        # RUSTFLAGS.
+        run: |
+          sep=$'\x1f'
+          flags="--remap-path-prefix=${{ github.workspace }}=/build${sep}--remap-path-prefix=${{ github.workspace }}/.cargo-home=/cargo-home"
+          echo "CARGO_ENCODED_RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+          echo "KN_KEYSTORE_PATH=${{ runner.temp }}/repro-check.jks" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - name: Install pinned toolchain
+        working-directory: core
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build
+        working-directory: app
+        env:
+          # The throwaway key from the `keystore` job, shared by both
+          # runners -- see its comment for why. Not the release key: this
+          # workflow never touches repository secrets.
+          KN_KEYSTORE_PASSWORD: reproCheck
+          KN_KEY_ALIAS: reproCheck
+          KN_KEY_PASSWORD: reproCheck
+        run: flutter build apk --release --split-per-abi
+      - name: Checksum
+        run: |
+          mkdir dist
+          cp app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+            dist/kilonova-android-arm64-v8a.apk
+          sha256sum dist/kilonova-android-arm64-v8a.apk | tee dist/kilonova-android-arm64-v8a.apk.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-${{ matrix.runner }}
+          path: dist/
+
+  compare:
+    name: Compare
+    needs: [linux, android]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+      - name: Diff the two runners' output
+        run: |
+          fail=0
+          for pair in "linux kilonova-linux-x64.tar.gz" "android kilonova-android-arm64-v8a.apk"; do
+            set -- $pair
+            platform="$1"
+            file="$2"
+            a="dist/$platform-1/$file"
+            b="dist/$platform-2/$file"
+            sha_a="$(sha256sum "$a" | cut -d' ' -f1)"
+            sha_b="$(sha256sum "$b" | cut -d' ' -f1)"
+            if [[ "$sha_a" == "$sha_b" ]]; then
+              echo "OK: $platform is reproducible ($sha_a)"
+            else
+              echo "::error::$platform differs between runners: $sha_a vs $sha_b"
+              fail=1
+            fi
+          done
+          exit "$fail"
