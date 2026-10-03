@@ -25,6 +25,14 @@ for size in 64 128 256 512; do
   cp "$here/icons/${size}x${size}/com.dhivalabs.kilonova.png" "$dir/"
 done
 
+# Reproducible build: staged files otherwise carry today's mtime, which
+# ends up in control.tar.gz/data.tar.gz inside the .deb. If the caller
+# gives us a SOURCE_DATE_EPOCH (the release workflow sets it to the tagged
+# commit's time), pin every staged file to it.
+if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+  find "$pkg" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+fi
+
 installed_kb="$(du -sk "$pkg" | cut -f1)"
 cat > "$pkg/DEBIAN/control" <<CONTROL
 Package: kilonova

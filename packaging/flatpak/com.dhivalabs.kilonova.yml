@@ -1,0 +1,69 @@
+# Flatpak manifest for Kilonova.
+#
+# Like the Snap (snap/snapcraft.yaml), this repackages the Linux build the
+# Release workflow already made and checksummed, so Flathub and GitHub ship
+# the same binary rather than a second build of the Flutter/Rust toolchain
+# inside the Flatpak sandbox. Bump `url`, `sha256` and `app-id`'s
+# `<release version=...>` entry together for each release; the checksum
+# comes from that release's SHA256SUMS. See README.md in this directory for
+# the Flathub submission steps, and docs/RELEASING.md.
+id: com.dhivalabs.kilonova
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: kilonova
+
+finish-args:
+  # Nodes, light wallet servers, a local Tor proxy and LAN discovery, all
+  # outgoing; Kilonova listens on nothing itself.
+  - --share=network
+  # GTK needs one of these to show a window; fallback-x11 covers desktops
+  # without Wayland (XWayland is not enough for some window managers).
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GTK's IPC (D-Bus session bus access for things like notifications)
+  - --share=ipc
+  # GPU acceleration for Flutter's renderer.
+  - --device=dri
+  # Deliberately no --filesystem=home or --filesystem=host: choosing a QR
+  # code image to scan goes through the file chooser portal
+  # (org.freedesktop.portal.FileChooser), which needs no filesystem
+  # permission at all. Wallet files live in the Flatpak's own app-private
+  # data directory (~/.var/app/com.dhivalabs.kilonova), which every
+  # Flatpak gets without a --filesystem grant.
+
+modules:
+  - name: kilonova
+    buildsystem: simple
+    sources:
+      - type: archive
+        url: https://github.com/Dhiva-Labs/kilonova/releases/download/v0.3.0/kilonova-0.3.0-linux-x64.tar.gz
+        sha256: 950df71c8a1f687652495ec49d6d3ce1fce3069c4b999ad7142871306bcb3b07
+        dest: kilonova-0.3.0
+      - type: file
+        path: ../linux/com.dhivalabs.kilonova.desktop
+      - type: file
+        path: ../linux/com.dhivalabs.kilonova.metainfo.xml
+      - type: file
+        path: ../linux/icons/64x64/com.dhivalabs.kilonova.png
+        dest: icons/64x64
+      - type: file
+        path: ../linux/icons/128x128/com.dhivalabs.kilonova.png
+        dest: icons/128x128
+      - type: file
+        path: ../linux/icons/256x256/com.dhivalabs.kilonova.png
+        dest: icons/256x256
+      - type: file
+        path: ../linux/icons/512x512/com.dhivalabs.kilonova.png
+        dest: icons/512x512
+    build-commands:
+      - mkdir -p /app/lib/kilonova
+      - cp -r kilonova-0.3.0/* /app/lib/kilonova/
+      - mkdir -p /app/bin
+      - ln -s /app/lib/kilonova/kilonova /app/bin/kilonova
+      - install -Dm644 com.dhivalabs.kilonova.desktop /app/share/applications/com.dhivalabs.kilonova.desktop
+      - install -Dm644 com.dhivalabs.kilonova.metainfo.xml /app/share/metainfo/com.dhivalabs.kilonova.metainfo.xml
+      - install -Dm644 icons/64x64/com.dhivalabs.kilonova.png /app/share/icons/hicolor/64x64/apps/com.dhivalabs.kilonova.png
+      - install -Dm644 icons/128x128/com.dhivalabs.kilonova.png /app/share/icons/hicolor/128x128/apps/com.dhivalabs.kilonova.png
+      - install -Dm644 icons/256x256/com.dhivalabs.kilonova.png /app/share/icons/hicolor/256x256/apps/com.dhivalabs.kilonova.png
+      - install -Dm644 icons/512x512/com.dhivalabs.kilonova.png /app/share/icons/hicolor/512x512/apps/com.dhivalabs.kilonova.png

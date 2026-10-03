@@ -1,0 +1,95 @@
+# Draft F-Droid build recipe for Kilonova.
+#
+# This is not read by anything in this repository; it is what gets copied
+# into fdroiddata as `metadata/com.dhivalabs.kilonova.yml` (F-Droid's
+# metadata lives in a separate repository, not alongside the app's own
+# source). See README.md in this directory for the merge-request steps.
+# Kept here, versioned with the app, so every release's PR to fdroiddata
+# starts from an up-to-date draft instead of someone's local copy.
+#
+# Unlike the Snap and Flatpak packaging, which repackage the already-built
+# GitHub release, F-Droid builds from source on its own servers with no
+# network access to anything not explicitly fetched during the build, so
+# this recipe has to reproduce what `flutter build apk` plus cargokit's
+# Rust build does, by hand, in `sudo`/`prebuild`.
+
+Categories:
+  - Money
+License: MIT
+SourceCode: https://github.com/Dhiva-Labs/kilonova
+IssueTracker: https://github.com/Dhiva-Labs/kilonova/issues
+Changelog: https://github.com/Dhiva-Labs/kilonova/blob/main/CHANGELOG.md
+
+AutoName: Kilonova
+Summary: 'Open-source Monero wallet: your own node or a light wallet server'
+Description: |
+  Kilonova is an open-source Monero wallet. Sync from a node you choose, or
+  from your own light wallet server, whose reports Kilonova checks with your
+  keys instead of trusting them.
+
+  * Several wallets on mainnet, stagenet and testnet; create, or restore
+    from a seed, a spend key, or as view-only.
+  * Send and receive with QR codes, payment requests that watch for their
+    payment, coin control, and payment proofs.
+  * Use a phone as an offline cold wallet that signs over QR codes.
+  * Tor or any SOCKS5 proxy for all traffic, pinned certificates for your
+    own node, and a second node's opinion on the chain.
+
+  Kilonova has not been audited. Do not keep more in it than you can afford
+  to lose.
+
+RepoType: git
+Repo: https://github.com/Dhiva-Labs/kilonova.git
+
+Builds:
+  - versionName: '0.3.0'
+    versionCode: 3
+    commit: v0.3.0
+    subdir: app/android
+    sudo:
+      - apt-get update
+      - apt-get install -y --no-install-recommends curl build-essential
+      # Pinned in core/rust-toolchain.toml; keep this in sync with that
+      # file on every toolchain bump.
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+      - sh /tmp/rustup-init.sh -y --default-toolchain none --profile minimal
+    srclibs:
+      # F-Droid's Flutter srclib; pinned to the same version as
+      # .github/workflows/release.yml's FLUTTER_VERSION.
+      - Flutter@3.44.6
+    prebuild:
+      - export PATH="$HOME/.cargo/bin:$PATH"
+      - rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      - rustup default 1.97.1
+      - rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - pushd $$Flutter$$ && bin/flutter config --no-analytics && bin/flutter precache --android && popd
+      - pushd ../.. && $$Flutter$$/bin/flutter pub get && popd
+    build:
+      - export PATH="$HOME/.cargo/bin:$$Flutter$$/bin:$PATH"
+      # A single universal APK, not the split-per-ABI build the GitHub
+      # release uses: F-Droid's own tooling expects one output file per
+      # Build entry. See README.md's "ABI split" note for the open
+      # question of whether to ask for per-ABI versionCodes instead.
+      - cd ../.. && flutter build apk --release
+    output: app/build/app/outputs/flutter-apk/app-release.apk
+    ndk: 27.0.12077973
+    # The Gradle wrapper jar is not committed (CI installs Gradle itself);
+    # if fdroiddata's checkout needs one, regenerate it instead of
+    # unignoring a binary:
+    #   gradle wrapper --gradle-version 9.1.0
+    scandelete:
+      - app/android/gradle/wrapper/gradle-wrapper.jar
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: '0.3.0'
+CurrentVersionCode: 3
+
+# Fixture and fuzz-corpus files that are genuinely binary test data (an
+# encrypted wallet-file fixture, fuzzer seed corpus), not vendored
+# binaries. They are not part of the Android build (app/android never
+# touches core/kn-store/tests or core/fuzz), only of the source tree
+# fdroiddata's scanner walks.
+ScanIgnore:
+  - core/kn-store/tests/fixtures
+  - core/fuzz/corpus
