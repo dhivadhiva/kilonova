@@ -26,3 +26,13 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
+
+# The app ships kn_ffi as a shared library (cargokit builds it with
+# `--release` against this workspace). One codegen unit with LTO lets the
+# optimizer work across crates; symbols are stripped (backtraces keep
+# function names only through panic messages). Panics stay `unwind`:
+# flutter_rust_bridge catches them and reports them to Dart.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
