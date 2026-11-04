@@ -30,4 +30,16 @@ updates:
     ignore:
       - dependency-name: flutter_rust_bridge
       # Pinned by flutter_localizations in the Flutter SDK; moves with Flutter.
+      # Ignoring it alone was not enough: #32 bumped it inside a group led
+      # by dbus, which broke `flutter pub get`. The two rules below keep that
+      # group from forming again.
       - dependency-name: intl
+      # A minor version of a 0.x package is a breaking one, and
+      # flutter_local_notifications_linux has to support it first. #32 took
+      # dev prereleases of both notification plugins to get dbus 0.8.
+      - dependency-name: dbus
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # Major versions change the shared platform interface; upgraded by
+      # hand, together, and only to stable releases.
+      - dependency-name: "flutter_local_notifications*"
+        update-types: ["version-update:semver-major"]

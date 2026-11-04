@@ -7,17 +7,17 @@ environment:
   sdk: ^3.12.2
 
 dependencies:
-  dbus: ^0.8.0
+  dbus: ^0.7.15
   file_selector: ^1.1.0
   flutter:
     sdk: flutter
-  flutter_local_notifications_linux: ^9.0.0-dev.2
-  flutter_local_notifications_windows: ^4.0.0-dev.2
+  flutter_local_notifications_linux: ^8.0.1
+  flutter_local_notifications_windows: ^3.1.1
   flutter_localizations:
     sdk: flutter
   flutter_rust_bridge: 2.13.0
   flutter_zxing: ^3.1.0
-  intl: 0.20.3
+  intl: any
   kn_ffi:
     path: rust_builder
   path_provider: ^2.1.6
